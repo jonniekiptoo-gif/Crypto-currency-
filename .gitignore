@@ -1,69 +1,1077 @@
-# Prerequisites
-*.d
+trading-platform/
+├── backend/
+│   ├── app/
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   ├── auth.py
+│   │   │   ├── trading.py
+│   │   │   ├── portfolio.py
+│   │   │   └── websocket.py
+│   │   ├── core/
+│   │   │   ├── __init__.py
+│   │   │   ├── config.py
+│   │   │   ├── security.py
+│   │   │   ├── database.py
+│   │   │   └── rate_limiter.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── user.py
+│   │   │   ├── order.py
+│   │   │   ├── transaction.py
+│   │   │   └── portfolio.py
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── cpp_bridge.py
+│   │   │   ├── market_data.py
+│   │   │   └── audit.py
+│   │   └── main.py
+│   ├── cpp_service/
+│   │   ├── src/
+│   │   │   ├── calculations.cpp
+│   │   │   ├── risk_engine.cpp
+│   │   │   └── main.cpp
+│   │   ├── include/
+│   │   │   └── calculations.h
+│   │   └── CMakeLists.txt
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
+│   ├── index.html
+│   ├── dashboard.html
+│   ├── login.html
+│   ├── register.html
+│   ├── css/
+│   │   ├── style.css
+│   │   └── themes.css
+│   ├── js/
+│   │   ├── app.js
+│   │   ├── auth.js
+│   │   ├── dashboard.js
+│   │   ├── trading.js
+│   │   ├── charts.js
+│   │   └── websocket.js
+│   └── assets/
+└── docker-compose.ymlimport os
+from pydantic_settings import BaseSettings
+from typing import Optional
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+class Settings(BaseSettings):
+    # Database
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/trading_db")
+    
+    # Security
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-here")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    
+    # 2FA
+    TOTP_SECRET: str = os.getenv("TOTP_SECRET", "your-totp-secret")
+    
+    # Rate Limiting
+    RATE_LIMIT_REQUESTS: int = 100
+    RATE_LIMIT_PERIOD: int = 60  # seconds
+    
+    # CORS
+    ALLOWED_ORIGINS: list = ["https://yourdomain.com", "https://localhost:3000"]
+    
+    # C++ Service
+    CPP_SERVICE_HOST: str = "localhost"
+    CPP_SERVICE_PORT: int = 8081
+    
+    class Config:
+        env_file = ".env"
 
-# Precompiled Headers
-*.gch
-*.pch
+settings = Settings()from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from typing import Optional
+import pyotp
+import bcrypt
+from .config import settings
 
-# Linker files
-*.ilk
+pwd_context = CryptContext(
+    schemes=["argon2id"],
+    deprecated="auto",
+    argon2id__memory_cost=65536,
+    argon2id__time_cost=3,
+    argon2id__parallelism=4
+)
 
-# Debugger Files
-*.pdb
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
 
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
 
-# Fortran module files
-*.mod
-*.smod
+def verify_token(token: str):
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return payload
+    except JWTError:
+        return None
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+def generate_totp_secret() -> str:
+    return pyotp.random_base32()
 
-# Executables
-*.exe
-*.out
-*.app
+def verify_totp(secret: str, token: str) -> bool:
+    totp = pyotp.TOTP(secret)
+    return totp.verify(token)
 
-# Build directories
-build/
-Build/
-build-*/
+def generate_totp_uri(secret: str, email: str) -> str:
+    totp = pyotp.TOTP(secret)
+    return totp.provisioning_uri(email, issuer_name="TradingPlatform")from sqlalchemy import create_engine, text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from typing import Generator
+from contextlib import contextmanager
+from .config import settings
 
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_size=20,
+    max_overflow=40,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    echo=False
+)
 
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-# vcpkg
-vcpkg_installed/
+def get_db() -> Generator:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# debug information files
-*.dwo
+@contextmanager
+def get_db_context():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
-# test output & cache
-Testing/
-.cache/
+# Parameterized query example with SQL injection protection
+def execute_parameterized_query(db: Session, query: str, params: dict):
+    """Execute a parameterized query safely"""
+    result = db.execute(text(query), params)
+    return resultfrom sqlalchemy import Column, String, DateTime, Boolean, Float, Integer, Text
+from sqlalchemy.sql import func
+from datetime import datetime
+from ..core.database import Base
+import uuid
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    full_name = Column(String(100))
+    created_at = Column(DateTime, server_default=func.now())
+    last_login = Column(DateTime)
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
+    
+    # 2FA
+    totp_secret = Column(String(32), nullable=True)
+    totp_enabled = Column(Boolean, default=False)
+    
+    # Rate limiting
+    failed_login_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    
+    # Profile
+    balance = Column(Float, default=0.0)
+    buying_power = Column(Float, default=0.0)
+    
+    # Preferences
+    theme = Column(String(10), default="dark")
+    
+    # Audit
+    audit_log = Column(Text, nullable=True)
+
+class Session(Base):
+    __tablename__ = "sessions"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), index=True)
+    token = Column(String(500), unique=True)
+    created_at = Column(DateTime, server_default=func.now())
+    expires_at = Column(DateTime)
+    ip_address = Column(String(45))
+    user_agent = Column(String(255))
+    is_active = Column(Boolean, default=True)from sqlalchemy import Column, String, DateTime, Float, Integer, Enum, ForeignKey
+from sqlalchemy.sql import func
+from ..core.database import Base
+import uuid
+import enum
+
+class OrderType(enum.Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+    STOP = "stop"
+    STOP_LIMIT = "stop_limit"
+
+class OrderSide(enum.Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+class OrderStatus(enum.Enum):
+    PENDING = "pending"
+    FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+
+class Order(Base):
+    __tablename__ = "orders"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    order_type = Column(Enum(OrderType), nullable=False)
+    side = Column(Enum(OrderSide), nullable=False)
+    quantity = Column(Float, nullable=False)
+    price = Column(Float, nullable=True)  # For limit/stop orders
+    stop_price = Column(Float, nullable=True)  # For stop orders
+    filled_quantity = Column(Float, default=0.0)
+    average_price = Column(Float, nullable=True)
+    status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    expires_at = Column(DateTime, nullable=True)
+    client_order_id = Column(String(50), unique=True)
+    
+    # Risk management
+    risk_check_passed = Column(Boolean, default=False)
+    risk_check_details = Column(String(500), nullable=True)from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
+from pydantic import BaseModel, EmailStr, validator
+import re
+from ..core.database import get_db
+from ..core.security import (
+    verify_password, get_password_hash, create_access_token,
+    generate_totp_secret, verify_totp, generate_totp_uri
+)
+from ..core.rate_limiter import rate_limit
+from ..models.user import User, Session as UserSession
+from ..services.audit import AuditService
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+security = HTTPBearer()
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+    totp_code: Optional[str] = None
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str
+    
+    @validator('password')
+    def validate_password(cls, v):
+        if len(v) < 12:
+            raise ValueError('Password must be at least 12 characters')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'\d', v):
+            raise ValueError('Password must contain at least one number')
+        if not re.search(r'[!@#$%^&*(),.?":{}|<>]', v):
+            raise ValueError('Password must contain at least one special character')
+        return v
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    refresh_token: str
+    totp_required: bool = False
+
+@router.post("/register", response_model=TokenResponse)
+@rate_limit(requests=5, period=60)  # 5 registrations per minute
+async def register(
+    request: RegisterRequest,
+    req: Request,
+    db: Session = Depends(get_db)
+):
+    """Register a new user with proper validation and rate limiting"""
+    
+    # Check if user exists
+    existing_user = db.query(User).filter(User.email == request.email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered"
+        )
+    
+    # Hash password with Argon2id
+    hashed_password = get_password_hash(request.password)
+    
+    # Generate TOTP secret
+    totp_secret = generate_totp_secret()
+    
+    # Create user
+    user = User(
+        email=request.email,
+        hashed_password=hashed_password,
+        full_name=request.full_name,
+        totp_secret=totp_secret,
+        is_verified=False  # Require email verification
+    )
+    
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    
+    # Audit log
+    AuditService.log_action(
+        db, user.id, "user_registered",
+        {"email": request.email, "ip": req.client.host}
+    )
+    
+    # Generate tokens
+    access_token = create_access_token(
+        data={"sub": user.id, "email": user.email},
+        expires_delta=timedelta(minutes=30)
+    )
+    
+    refresh_token = create_access_token(
+        data={"sub": user.id, "type": "refresh"},
+        expires_delta=timedelta(days=7)
+    )
+    
+    # Store session
+    session = UserSession(
+        user_id=user.id,
+        token=access_token,
+        expires_at=datetime.utcnow() + timedelta(minutes=30),
+        ip_address=req.client.host,
+        user_agent=req.headers.get("user-agent")
+    )
+    db.add(session)
+    db.commit()
+    
+    return TokenResponse(
+        access_token=access_token,
+        expires_in=1800,
+        refresh_token=refresh_token,
+        totp_required=False  # User should set up 2FA later
+    )
+
+@router.post("/login")
+@rate_limit(requests=5, period=60)
+async def login(
+    request: LoginRequest,
+    req: Request,
+    db: Session = Depends(get_db)
+):
+    """Login with email, password, and optional 2FA"""
+    
+    # Get user
+    user = db.query(User).filter(User.email == request.email).first()
+    if not user:
+        # Security: Don't reveal if email exists
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials"
+        )
+    
+    # Check if account is locked
+    if user.locked_until and user.locked_until > datetime.utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Account locked until {user.locked_until}"
+        )
+    
+    # Verify password
+    if not verify_password(request.password, user.hashed_password):
+        user.failed_login_attempts += 1
+        if user.failed_login_attempts >= 5:
+            user.locked_until = datetime.utcnow() + timedelta(minutes=15)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials"
+        )
+    
+    # Reset failed attempts
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    
+    # Verify 2FA if enabled
+    if user.totp_enabled:
+        if not request.totp_code:
+            return TokenResponse(
+                access_token="",
+                expires_in=0,
+                refresh_token="",
+                totp_required=True
+            )
+        
+        if not verify_totp(user.totp_secret, request.totp_code):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid 2FA code"
+            )
+    
+    # Update last login
+    user.last_login = datetime.utcnow()
+    
+    # Generate tokens
+    access_token = create_access_token(
+        data={"sub": user.id, "email": user.email},
+        expires_delta=timedelta(minutes=30)
+    )
+    
+    refresh_token = create_access_token(
+        data={"sub": user.id, "type": "refresh"},
+        expires_delta=timedelta(days=7)
+    )
+    
+    # Store session
+    session = UserSession(
+        user_id=user.id,
+        token=access_token,
+        expires_at=datetime.utcnow() + timedelta(minutes=30),
+        ip_address=req.client.host,
+        user_agent=req.headers.get("user-agent")
+    )
+    db.add(session)
+    db.commit()
+    
+    # Audit log
+    AuditService.log_action(
+        db, user.id, "user_login",
+        {"ip": req.client.host, "user_agent": req.headers.get("user-agent")}
+    )
+    
+    return TokenResponse(
+        access_token=access_token,
+        expires_in=1800,
+        refresh_token=refresh_token,
+        totp_required=False
+    )
+
+@router.post("/logout")
+async def logout(
+    req: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    """Logout - invalidate the session"""
+    
+    token = credentials.credentials
+    session = db.query(UserSession).filter(
+        UserSession.token == token,
+        UserSession.is_active == True
+    ).first()
+    
+    if session:
+        session.is_active = False
+        db.commit()
+        AuditService.log_action(
+            db, session.user_id, "user_logout",
+            {"ip": req.client.host}
+        )
+    
+    return {"message": "Logged out successfully"}from functools import wraps
+from fastapi import HTTPException, Request
+from datetime import datetime, timedelta
+import redis
+from typing import Dict, Optional
+from .config import settings
+
+# Redis client for distributed rate limiting
+redis_client = redis.Redis(
+    host='redis',
+    port=6379,
+    decode_responses=True
+)
+
+def rate_limit(requests: int = 100, period: int = 60):
+    """
+    Rate limiting decorator using Redis
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Get request object
+            req = None
+            for arg in args:
+                if isinstance(arg, Request):
+                    req = arg
+                    break
+            
+            if not req:
+                # If no request in args, look in kwargs
+                req = kwargs.get('req') or kwargs.get('request')
+            
+            if not req:
+                return await func(*args, **kwargs)
+            
+            # Rate limiting key: IP + endpoint
+            client_ip = req.client.host
+            endpoint = req.url.path
+            key = f"rate_limit:{client_ip}:{endpoint}"
+            
+            # Get current count
+            current = redis_client.get(key)
+            
+            if current is None:
+                # First request
+                redis_client.setex(key, period, 1)
+                return await func(*args, **kwargs)
+            
+            current = int(current)
+            if current >= requests:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded. Maximum {requests} requests per {period} seconds."
+                )
+            
+            # Increment counter
+            redis_client.incr(key)
+            
+            return await func(*args, **kwargs)
+        return wrapper
+    return decoratorimport asyncio
+import json
+import socket
+from typing import Dict, Any, Optional
+from ..core.config import settings
+
+class CPPBridgeService:
+    """Bridge between Python backend and C++ calculation service"""
+    
+    def __init__(self):
+        self.host = settings.CPP_SERVICE_HOST
+        self.port = settings.CPP_SERVICE_PORT
+        self.socket_timeout = 5.0
+    
+    async def send_request(self, request_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Send request to C++ service over TCP"""
+        
+        try:
+            # Connect to C++ service
+            reader, writer = await asyncio.open_connection(
+                self.host, self.port
+            )
+            
+            # Prepare message
+            message = {
+                "type": request_type,
+                "data": data
+            }
+            json_msg = json.dumps(message) + "\n"
+            
+            # Send request
+            writer.write(json_msg.encode())
+            await writer.drain()
+            
+            # Receive response
+            response = await asyncio.wait_for(
+                reader.readline(),
+                timeout=self.socket_timeout
+            )
+            
+            writer.close()
+            await writer.wait_closed()
+            
+            return json.loads(response.decode())
+            
+        except asyncio.TimeoutError:
+            return {"error": "C++ service timeout"}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    async def calculate_risk_metrics(
+        self,
+        positions: List[Dict[str, float]],
+        prices: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """Calculate risk metrics using C++ engine"""
+        
+        data = {
+            "positions": positions,
+            "prices": prices
+        }
+        return await self.send_request("risk_metrics", data)
+    
+    async def calculate_portfolio_stats(
+        self,
+        holdings: Dict[str, float],
+        historical_prices: List[float]
+    ) -> Dict[str, Any]:
+        """Calculate statistical portfolio metrics"""
+        
+        data = {
+            "holdings": holdings,
+            "historical_prices": historical_prices
+        }
+        return await self.send_request("portfolio_stats", data)
+    
+    async def validate_order(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        balance: float
+    ) -> Dict[str, Any]:
+        """Validate order with C++ risk engine"""
+        
+        data = {
+            "symbol": symbol,
+            "quantity": quantity,
+            "price": price,
+            "balance": balance
+        }
+        return await self.send_request("validate_order", data)from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+from datetime import datetime
+from pydantic import BaseModel, validator
+from typing import Optional
+from ..core.database import get_db
+from ..core.security import verify_token
+from ..core.rate_limiter import rate_limit
+from ..models.user import User
+from ..models.order import Order, OrderType, OrderSide, OrderStatus
+from ..services.cpp_bridge import CPPBridgeService
+from ..services.audit import AuditService
+
+router = APIRouter(prefix="/trading", tags=["trading"])
+security = HTTPBearer()
+
+class OrderRequest(BaseModel):
+    symbol: str
+    order_type: OrderType
+    side: OrderSide
+    quantity: float
+    price: Optional[float] = None
+    stop_price: Optional[float] = None
+    
+    @validator('quantity')
+    def validate_quantity(cls, v):
+        if v <= 0:
+            raise ValueError('Quantity must be positive')
+        return v
+    
+    @validator('price')
+    def validate_price(cls, v, values):
+        if 'order_type' in values:
+            if values['order_type'] in [OrderType.LIMIT, OrderType.STOP_LIMIT]:
+                if v is None or v <= 0:
+                    raise ValueError('Limit orders require a positive price')
+        return v
+
+@router.post("/order")
+@rate_limit(requests=20, period=60)  # 20 orders per minute
+async def place_order(
+    request: OrderRequest,
+    req: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    """Place a new order with server-side validation"""
+    
+    # Verify token
+    token_data = verify_token(credentials.credentials)
+    if not token_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+    
+    user_id = token_data.get("sub")
+    
+    # Get user with balance
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Server-side validation: Check balance
+    if request.side == OrderSide.BUY:
+        # Validate sufficient buying power
+        required_amount = request.quantity * (request.price or 0)
+        if required_amount > user.buying_power:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Insufficient buying power"
+            )
+    
+    # Validate order with C++ risk engine
+    cpp_service = CPPBridgeService()
+    validation_result = await cpp_service.validate_order(
+        symbol=request.symbol,
+        quantity=request.quantity,
+        price=request.price or 0,
+        balance=user.balance
+    )
+    
+    if not validation_result.get("valid", False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Risk validation failed: {validation_result.get('reason', 'Unknown')}"
+        )
+    
+    # Create order with client_order_id for idempotency
+    import uuid
+    client_order_id = str(uuid.uuid4())
+    
+    # Check for duplicate order
+    existing_order = db.query(Order).filter(
+        Order.client_order_id == client_order_id
+    ).first()
+    
+    if existing_order:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate order detected"
+        )
+    
+    # Create order
+    order = Order(
+        user_id=user_id,
+        symbol=request.symbol,
+        order_type=request.order_type,
+        side=request.side,
+        quantity=request.quantity,
+        price=request.price,
+        stop_price=request.stop_price,
+        status=OrderStatus.PENDING,
+        client_order_id=client_order_id,
+        risk_check_passed=validation_result.get("valid", False)
+    )
+    
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    
+    # Audit log
+    AuditService.log_action(
+        db, user_id, "order_placed",
+        {
+            "order_id": order.id,
+            "symbol": request.symbol,
+            "side": request.side.value,
+            "quantity": request.quantity,
+            "price": request.price
+        }
+    )
+    
+    # In a real system, this would trigger order processing
+    # For now, simulate immediate fill for market orders
+    if request.order_type == OrderType.MARKET:
+        order.status = OrderStatus.FILLED
+        order.filled_quantity = request.quantity
+        order.average_price = 100  # Would be actual market price
+        db.commit()
+    
+    return {
+        "order_id": order.id,
+        "client_order_id": client_order_id,
+        "status": order.status.value,
+        "message": "Order placed successfully"
+    }
+
+@router.get("/orders")
+async def get_orders(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+    status_filter: Optional[str] = None
+):
+    """Get user's order history with filtering"""
+    
+    token_data = verify_token(credentials.credentials)
+    if not token_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+    
+    user_id = token_data.get("sub")
+    
+    # Query orders with server-side filtering
+    query = db.query(Order).filter(Order.user_id == user_id)
+    
+    if status_filter:
+        try:
+            status_enum = OrderStatus(status_filter)
+            query = query.filter(Order.status == status_enum)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid status filter"
+            )
+    
+    orders = query.order_by(Order.created_at.desc()).limit(100).all()
+    
+    return {
+        "orders": [
+            {
+                "id": order.id,
+                "symbol": order.symbol,
+                "type": order.order_type.value,
+                "side": order.side.value,
+                "quantity": order.quantity,
+                "filled_quantity": order.filled_quantity,
+                "price": order.price,
+                "average_price": order.average_price,
+                "status": order.status.value,
+                "created_at": order.created_at.isoformat()
+            }
+            for order in orders
+        ]
+    }from sqlalchemy.orm import Session
+from datetime import datetime
+from ..models.audit import AuditLog
+import json
+
+class AuditService:
+    """Service for maintaining audit trails"""
+    
+    @staticmethod
+    def log_action(
+        db: Session,
+        user_id: str,
+        action: str,
+        details: dict,
+        ip_address: str = None,
+        user_agent: str = None
+    ):
+        """Log an action for audit purposes"""
+        
+        audit_entry = AuditLog(
+            user_id=user_id,
+            action=action,
+            details=json.dumps(details),
+            ip_address=ip_address,
+            user_agent=user_agent,
+            timestamp=datetime.utcnow()
+        )
+        
+        db.add(audit_entry)
+        db.commit()
+        
+        # In production, this would also write to a secure, immutable log
+        # and potentially send to a SIEM system
+        
+        return audit_entry#include <iostream>
+#include <vector>
+#include <unordered_map>
+#include <cmath>
+#include <string>
+#include <json/json.h>
+#include <numeric>
+#include <algorithm>
+
+class RiskEngine {
+public:
+    struct Position {
+        std::string symbol;
+        double quantity;
+        double average_price;
+    };
+    
+    struct RiskMetrics {
+        double total_value;
+        double daily_pnl;
+        double max_drawdown;
+        double var_95;
+        double risk_score;
+        bool is_risk_level_valid;
+    };
+    
+    static Json::Value validateOrder(const Json::Value& request) {
+        Json::Value response;
+        response["valid"] = false;
+        
+        try {
+            std::string symbol = request["symbol"].asString();
+            double quantity = request["quantity"].asDouble();
+            double price = request["price"].asDouble();
+            double balance = request["balance"].asDouble();
+            
+            // Validate price and quantity
+            if (quantity <= 0 || price <= 0) {
+                response["reason"] = "Invalid quantity or price";
+                return response;
+            }
+            
+            // Check if order exceeds balance
+            double order_value = quantity * price;
+            if (order_value > balance * 0.95) {  // 95% max utilization
+                response["reason"] = "Order exceeds risk tolerance (95% max utilization)";
+                return response;
+            }
+            
+            // Check for position concentration risk
+            double max_position_size = balance * 0.3;  // 30% max concentration
+            if (order_value > max_position_size) {
+                response["reason"] = "Position concentration risk exceeded (30% max)";
+                return response;
+            }
+            
+            // Additional risk checks
+            if (quantity < 0.0001 || quantity > 1000000) {
+                response["reason"] = "Quantity outside acceptable range";
+                return response;
+            }
+            
+            response["valid"] = true;
+            response["risk_score"] = calculateRiskScore(order_value, balance);
+            
+        } catch (const std::exception& e) {
+            response["reason"] = "Error in risk validation";
+        }
+        
+        return response;
+    }
+    
+    static Json::Value calculateRiskMetrics(const Json::Value& request) {
+        Json::Value response;
+        
+        try {
+            auto positionsData = request["positions"];
+            std::vector<Position> positions;
+            
+            for (const auto& pos : positionsData) {
+                Position p;
+                p.symbol = pos["symbol"].asString();
+                p.quantity = pos["quantity"].asDouble();
+                p.average_price = pos["average_price"].asDouble();
+                positions.push_back(p);
+            }
+            
+            std::vector<double> prices;
+            auto pricesData = request["prices"];
+            for (const auto& price : pricesData) {
+                prices.push_back(price.asDouble());
+            }
+            
+            // Calculate risk metrics
+            RiskMetrics metrics = computeMetrics(positions, prices);
+            
+            response["total_value"] = metrics.total_value;
+            response["daily_pnl"] = metrics.daily_pnl;
+            response["max_drawdown"] = metrics.max_drawdown;
+            response["var_95"] = metrics.var_95;
+            response["risk_score"] = metrics.risk_score;
+            response["is_risk_level_valid"] = metrics.is_risk_level_valid;
+            
+        } catch (const std::exception& e) {
+            response["error"] = "Risk calculation error";
+        }
+        
+        return response;
+    }
+    
+private:
+    static double calculateRiskScore(double order_value, double balance) {
+        if (balance <= 0) return 100.0;  // Maximum risk
+        
+        double utilization = (order_value / balance) * 100.0;
+        double risk_score = utilization * 1.2;  // Scale factor
+        
+        // Cap at 100
+        return std::min(risk_score, 100.0);
+    }
+    
+    static RiskMetrics computeMetrics(const std::vector<Position>& positions, 
+                                      const std::vector<double>& prices) {
+        RiskMetrics metrics;
+        metrics.total_value = 0.0;
+        metrics.daily_pnl = 0.0;
+        metrics.max_drawdown = 0.0;
+        metrics.var_95 = 0.0;
+        metrics.risk_score = 0.0;
+        metrics.is_risk_level_valid = true;
+        
+        // Calculate total position value
+        for (const auto& pos : positions) {
+            metrics.total_value += pos.quantity * pos.average_price;
+        }
+        
+        // Calculate statistical metrics if we have enough data
+        if (prices.size() > 20) {
+            // Daily P&L (simple approximation)
+            metrics.daily_pnl = calculateDailyPnL(prices);
+            
+            // Maximum drawdown
+            metrics.max_drawdown = calculateMaxDrawdown(prices);
+            
+            // Value at Risk (95% confidence)
+            metrics.var_95 = calculateValueAtRisk(prices, 0.95);
+        }
+        
+        // Risk score based on position concentration and leverage
+        double concentration = calculateConcentration(positions);
+        double leverage = calculateLeverage(positions, metrics.total_value);
+        
+        metrics.risk_score = (concentration * 0.5 + leverage * 0.5);
+        
+        // Normalize risk score
+        if (metrics.risk_score > 100.0) {
+            metrics.risk_score = 100.0;
+        }
+        
+        return metrics;
+    }
+    
+    static double calculateDailyPnL(const std::vector<double>& prices) {
+        if (prices.size() < 2) return 0.0;
+        
+        double price_change = prices.back() - prices.front();
+        double avg_price = std::accumulate(prices.begin(), prices.end(), 0.0) / prices.size();
+        
+        return (price_change / avg_price) * 100.0;
+    }
+    
+    static double calculateMaxDrawdown(const std::vector<double>& prices) {
+        if (prices.empty()) return 0.0;
+        
+        double max_drawdown = 0.0;
+        double peak = prices[0];
+        
+        for (double price : prices) {
+            if (price > peak) {
+                peak = price;
+            }
+            double drawdown = ((peak - price) / peak) * 100.0;
+            if (drawdown > max_drawdown) {
+                max_drawdown = drawdown;
+            }
+        }
+        
+        return max_drawdown;
+    }
+    
+    static
